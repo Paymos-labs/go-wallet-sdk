@@ -1,0 +1,90 @@
+package paymos
+
+// The read model, ported field-for-field from the Python SDK.
+//
+// Every amount is a STRING of raw integer units, never a number. A token with 18 decimals runs
+// past what an IEEE 754 double holds exactly, so a JSON parser that produced numbers here would
+// round somebody's balance without saying so. Use FormatUnits to show one and ParseUnits to build
+// one.
+
+// Asset is one asset the vault can hold, as the server names it.
+type Asset struct {
+	Asset    string `json:"asset"`
+	Symbol   string `json:"symbol"`
+	Chain    string `json:"chain"`
+	Decimals int    `json:"decimals"`
+}
+
+// Balance is what the vault holds of one asset. USD is a display estimate and may be empty.
+type Balance struct {
+	Asset     string `json:"asset"`
+	Symbol    string `json:"symbol"`
+	Chain     string `json:"chain"`
+	Decimals  int    `json:"decimals"`
+	AmountRaw string `json:"amount_raw"`
+	USD       string `json:"usd"`
+}
+
+// RouteFee is the routing layer's own fee. Estimate marks a figure that can still move.
+type RouteFee struct {
+	Amount   string `json:"amount"`
+	Estimate bool   `json:"estimate"`
+}
+
+// Fees is every charge on an operation, split so none of them can hide inside another.
+type Fees struct {
+	Asset    string            `json:"asset"`
+	Platform string            `json:"platform"`
+	Network  string            `json:"network"`
+	Route    *RouteFee         `json:"route"`
+	Total    string            `json:"total"`
+	USD      map[string]string `json:"usd"`
+}
+
+// Amount is a raw integer amount string plus its asset.
+type Amount struct {
+	Amount string `json:"amount"`
+	Asset  string `json:"asset"`
+}
+
+// Receive is what arrives. Min is the floor the operation is allowed to deliver — guaranteed.
+type Receive struct {
+	Amount string `json:"amount"`
+	Min    string `json:"min"`
+	Asset  string `json:"asset"`
+}
+
+// Quote is a preview of an operation. MovementID is empty on a dry preview; Sources is the
+// number of co-signing sessions a real quote will need.
+type Quote struct {
+	MovementID string `json:"movement_id"`
+	Mode       string `json:"mode"`
+	Send       Amount `json:"send"`
+	// Debit is the MAXIMUM this quote may take from the vault, reserve against slippage
+	// included — a ceiling, not a prediction. Approve against this and nothing can debit more
+	// than you agreed to; an exact-output route routinely spends less and returns the
+	// difference. Compare the finished movement's Send to see what it actually cost.
+	Debit     Amount  `json:"debit"`
+	Receive   Receive `json:"receive"`
+	Fees      *Fees   `json:"fees"`
+	ExpiresAt string  `json:"expires_at"`
+	Sources   *int    `json:"sources"`
+}
+
+// Movement is one operation's lifecycle, newest state included.
+type Movement struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	// Send is what the movement actually cost the vault: the approved maximum minus anything
+	// the route handed back. This is the figure that matches the on-chain balance — reconcile
+	// on it. It is NOT the quote's Debit, which is the ceiling that was approved before the
+	// route ran.
+	Send                 Amount  `json:"send"`
+	Receive              Receive `json:"receive"`
+	Fees                 *Fees   `json:"fees"`
+	DestChainTxHash      string  `json:"dest_chain_tx_hash"`
+	DestChainExplorerURL string  `json:"dest_chain_explorer_url"`
+	CreatedAt            string  `json:"created_at"`
+	CompletedAt          string  `json:"completed_at"`
+}
