@@ -113,10 +113,10 @@ either direction. `paymos.ParseUnits` / `paymos.FormatUnits` convert between the
 
 **Moving money.** `Swap` and `Withdraw` (full key only) create a real movement and drive the
 2-of-2 co-sign. Before any signature the SDK re-checks that the server's quote echoes exactly
-the assets and amount you approved — a decimals bug, contract drift, or a lying server fails the
-call and **signs nothing**.
+the assets and amount you approved — a decimals bug, contract drift, or a quote that differs from
+your request fails the call and **signs nothing**.
 
-**Safety caps.** `SwapOptions.MinReceive` floors the guaranteed receive (`KindSlippageExceeded`
+**Safety caps.** `SwapOptions.MinReceive` floors the quote's minimum receive (`KindSlippageExceeded`
 below it, nothing signed); `MaxDebit` ceilings the total vault debit — strongly recommended for
 unattended `exact_out` payouts; `IdempotencyKey` makes a retry after an ambiguous failure replay
 the same movement instead of paying twice.
@@ -136,7 +136,7 @@ failures) and `RetryAfter` (rate limits). Branch on the kind:
 var pe *paymos.Error
 switch {
 case errors.As(err, &pe) && pe.Kind == paymos.KindSlippageExceeded:
-	// guaranteed receive below your floor — nothing signed
+	// quoted minimum receive below your floor — nothing signed
 case errors.As(err, &pe) && pe.Kind == paymos.KindInsufficientFunds:
 	// not enough balance for amount + fees
 case errors.As(err, &pe) && pe.Kind == paymos.KindRateLimited:
@@ -150,7 +150,7 @@ case errors.As(err, &pe) && pe.Kind == paymos.KindRateLimited:
 | `KindForbidden` | `403` — the key is valid but lacks the scope this call needs |
 | `KindInsufficientFunds` | `400` — the vault balance can't cover the amount (plus fees) |
 | `KindQuoteExpired` | `400` — the referenced quote expired; fetch a fresh one |
-| `KindSlippageExceeded` | `400` or local — delivered / guaranteed amount fell below your floor |
+| `KindSlippageExceeded` | `400` or local — delivered / quoted minimum amount fell below your floor |
 | `KindCrossAssetWithdraw` | `400` — a withdraw changed the asset (that's a swap) |
 | `KindRouteUnavailable` | `400` — no route could be quoted right now; retry shortly |
 | `KindRateLimited` | `429` — carries `RetryAfter` (seconds, or 0) |
@@ -165,9 +165,11 @@ read key can never sign.
 - A leaked **API key alone cannot move funds** — no share, no signature (and the key can be
   revoked).
 - A leaked **share alone cannot move funds** — no server co-sign.
-- Both are required, on purpose. The SDK additionally verifies every message it co-signs, and
-  that the server's quote matches exactly what you approved — so a compromised server can't
-  redirect funds or inflate an amount past your caps.
+- Both are required, on purpose. The SDK additionally checks every message it co-signs (your
+  vault as signer, the asset's token, an amount no larger than the approved debit) and that the
+  server's quote echoes what you approved. What it does not check: the **recipient** — the route's
+  deposit address is chosen by the server — and, for `exact_out`, the debit itself, which the
+  server computes. Set `MaxDebit` on unattended payouts so a wrong debit is refused.
 
 Treat a full `vs_live_…` secret like a private key, and back up the share — losing it means
 losing your ability to co-sign.
@@ -206,9 +208,17 @@ your half of the signature exists.
 ### Does it blind-sign whatever the server asks for?
 
 No, and this is the part worth reading twice. The server discloses the exact message it wants
-signed; the SDK recomputes the digest itself and refuses unless that message belongs to your vault,
-moves no more than the debit you approved, and matches the request you made. A server asking for
-anything else gets a refusal, not a signature.
+signed; the SDK recomputes the digest itself and refuses unless that message is a single transfer
+from your vault, of a positive amount, and the sources together move no more than the approved
+debit. Two limits: the recipient is chosen by the server and is not checked, and for `exact_out` the
+approved debit is itself server-computed — pass `MaxDebit` for unattended payouts.
+
+Each disclosed transfer must also move the asset you are sending: its token id must hash to the
+fingerprint `/assets` publishes for that asset. That fingerprint comes from the same server, so the
+check catches a server bug or a compromised signing path, not a fully compromised server. For a
+trust anchor independent of the server, pin fingerprints you obtained out of band —
+`paymos.NewWallet(secret, "", 0, paymos.PinnedFingerprints(map[string][]string{"USDC@base": {"a42c…"}}))`.
+A pinned asset is checked against your values only; `/assets` is ignored for it.
 
 ### Which networks and assets are supported?
 
@@ -233,7 +243,8 @@ sign — not the funds.
 ### What happens if a transfer is interrupted?
 
 Every money-moving call takes an idempotency key. Repeating a call with the same key returns the
-original operation instead of starting a second one, so a retry after a timeout cannot pay twice.
+original operation instead of starting a second one, so a retry after a timeout with the same key
+replays the first payment rather than making another.
 
 ## The same wallet, in eight languages
 

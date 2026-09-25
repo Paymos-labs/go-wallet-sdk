@@ -44,7 +44,19 @@ func newHTTP(baseURL, apiKey string, timeout time.Duration) *httpTransport {
 	}
 }
 
-func messageOf(body map[string]any, status int, text string) string {
+// maxRawMessage caps how much of a non-JSON body becomes an error message.
+const maxRawMessage = 300
+
+// looksLikeHTML spots a page served where the API should have answered — a proxy's 404, a site's
+// fallback route. Echoing that page back as the error message helps nobody.
+func looksLikeHTML(contentType, text string) bool {
+	if strings.Contains(strings.ToLower(contentType), "html") {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(text), "<")
+}
+
+func messageOf(body map[string]any, status int, text, contentType string) string {
 	if body != nil {
 		for _, key := range []string{"error", "detail"} {
 			if msg, ok := body[key].(string); ok && msg != "" {
@@ -52,7 +64,14 @@ func messageOf(body map[string]any, status int, text string) string {
 			}
 		}
 	}
+	if looksLikeHTML(contentType, text) {
+		return "request failed with status " + strconv.Itoa(status) +
+			": the server answered an HTML page, not the vault API's JSON — check the base URL"
+	}
 	trimmed := strings.TrimSpace(text)
+	if len(trimmed) > maxRawMessage {
+		trimmed = trimmed[:maxRawMessage] + "…"
+	}
 	if trimmed != "" {
 		return trimmed
 	}
@@ -85,8 +104,8 @@ func classify400(message string, status int) *Error {
 	return newError(KindGeneral, status, "%s", message)
 }
 
-func raiseFor(status int, body map[string]any, text string, retryAfterHeader string) *Error {
-	message := messageOf(body, status, text)
+func raiseFor(status int, body map[string]any, text, contentType, retryAfterHeader string) *Error {
+	message := messageOf(body, status, text, contentType)
 	switch status {
 	case 401:
 		return newError(KindAuth, status, "%s", message)
@@ -123,13 +142,26 @@ func (h *httpTransport) do(req *http.Request) (json.RawMessage, error) {
 		// A non-object or non-JSON body stays nil — messageOf falls back to the raw text.
 		_ = json.Unmarshal(text, &body)
 	}
+	contentType := resp.Header.Get("content-type")
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if len(text) == 0 {
 			return json.RawMessage("null"), nil
 		}
+		// A 2xx that is not JSON is not a success: it is some other server answering (a site's
+		// fallback page on the API's path). Refuse it here, typed, rather than let a caller
+		// meet a parse error with no status.
+		if !json.Valid(text) {
+			what := "a non-JSON body"
+			if looksLikeHTML(contentType, string(text)) {
+				what = "an HTML page"
+			}
+			return nil, newError(KindGeneral, resp.StatusCode,
+				"the server answered %d with %s, not the vault API's JSON — check the base URL",
+				resp.StatusCode, what)
+		}
 		return json.RawMessage(text), nil
 	}
-	return nil, raiseFor(resp.StatusCode, body, string(text), resp.Header.Get("retry-after"))
+	return nil, raiseFor(resp.StatusCode, body, string(text), contentType, resp.Header.Get("retry-after"))
 }
 
 func (h *httpTransport) get(path string, query url.Values) (json.RawMessage, error) {

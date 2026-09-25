@@ -38,8 +38,10 @@ func kindOf(t *testing.T, err error) Kind {
 	return pe.Kind
 }
 
+// The server answers /assets with a bare array — never {"assets": [...]}. This test used to mock
+// the wrapper, and the SDK passed it while every real quote failed as "unknown asset".
 func TestReturnsParsedJSONOn2xx(t *testing.T) {
-	w, _ := walletOver(t, 200, `{"assets":[{"asset":"USDC@base","symbol":"USDC","chain":"base","decimals":6}]}`, nil)
+	w, _ := walletOver(t, 200, `[{"asset":"USDC@base","symbol":"USDC","chain":"base","decimals":6}]`, nil)
 	assets, err := w.Assets()
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +132,7 @@ func TestSendsTheBearerTokenAndIdempotencyKey(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/vault/v1/assets":
-			fmt.Fprint(w, `{"assets":[{"asset":"USDC@base","symbol":"USDC","chain":"base","decimals":6}]}`)
+			fmt.Fprint(w, `[{"asset":"USDC@base","symbol":"USDC","chain":"base","decimals":6}]`)
 		case "/vault/v1/quote/withdraw":
 			seenAuth = r.Header.Get("authorization")
 			seenIdem = r.Header.Get("idempotency-key")

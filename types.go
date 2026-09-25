@@ -7,12 +7,17 @@ package paymos
 // round somebody's balance without saying so. Use FormatUnits to show one and ParseUnits to build
 // one.
 
-// Asset is one asset the vault can hold, as the server names it.
+// Asset is one asset the vault can hold, as the server names it. Fingerprint is the lowercase hex
+// SHA-256 of the asset's raw token id, as the server publishes it; the co-sign checks every
+// disclosed transfer against it unless PinnedFingerprints pins the label. It is empty from a server
+// that predates it — reads still work, a co-sign is refused. One label may appear more than once
+// (two contracts of one coin), each with its own fingerprint.
 type Asset struct {
-	Asset    string `json:"asset"`
-	Symbol   string `json:"symbol"`
-	Chain    string `json:"chain"`
-	Decimals int    `json:"decimals"`
+	Asset       string `json:"asset"`
+	Symbol      string `json:"symbol"`
+	Chain       string `json:"chain"`
+	Decimals    int    `json:"decimals"`
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // Balance is what the vault holds of one asset. USD is a display estimate and may be empty.
@@ -47,7 +52,8 @@ type Amount struct {
 	Asset  string `json:"asset"`
 }
 
-// Receive is what arrives. Min is the floor the operation is allowed to deliver — guaranteed.
+// Receive is what the quote says arrives. Min is the minimum the quote states; the SDK compares it
+// with SwapOptions.MinReceive before signing, but does not observe what is delivered.
 type Receive struct {
 	Amount string `json:"amount"`
 	Min    string `json:"min"`
@@ -61,9 +67,10 @@ type Quote struct {
 	Mode       string `json:"mode"`
 	Send       Amount `json:"send"`
 	// Debit is the MAXIMUM this quote may take from the vault, reserve against slippage
-	// included — a ceiling, not a prediction. Approve against this and nothing can debit more
-	// than you agreed to; an exact-output route routinely spends less and returns the
-	// difference. Compare the finished movement's Send to see what it actually cost.
+	// included — a ceiling, not a prediction. The co-sign refuses sources that move more than
+	// it, but the server computes it: for exact_out cap it with MaxDebit, especially for
+	// unattended payouts. An exact-output route routinely spends less and returns the
+	// difference; compare the finished movement's Send to see what it actually cost.
 	Debit     Amount  `json:"debit"`
 	Receive   Receive `json:"receive"`
 	Fees      *Fees   `json:"fees"`
