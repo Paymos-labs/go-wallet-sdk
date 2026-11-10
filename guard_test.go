@@ -9,6 +9,7 @@ package paymos
 import (
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -158,6 +159,284 @@ func TestBlindSignGuardRefusesUnsignedAmountTricks(t *testing.T) {
 	err := verifySigningDisclosure(quote, []json.RawMessage{a, b}, []json.RawMessage{da, db}, guardKeyPkg, guardFingerprint)
 	if err == nil || !strings.Contains(err.Error(), "co-sign refused") {
 		t.Fatalf("2D/-D disclosure must be refused, got %v", err)
+	}
+}
+
+// ── the guard reads the message the chain reads ─────────────────────────────
+
+// legacyRead decodes a message the way this guard used to: encoding/json into a struct, which
+// matches keys case-insensitively and keeps the last of a repeated one. The decoy tests below
+// first prove their payload fools it — so a payload that stops being a decoy fails here, instead
+// of the test going on to "pass" against nothing.
+func legacyRead(t *testing.T, message string) (signer, intent string, tokens map[string]string) {
+	t.Helper()
+	var parsed struct {
+		SignerID string `json:"signer_id"`
+		Intents  []struct {
+			Intent string            `json:"intent"`
+			Tokens map[string]string `json:"tokens"`
+		} `json:"intents"`
+	}
+	if err := json.Unmarshal([]byte(message), &parsed); err != nil || len(parsed.Intents) != 1 {
+		t.Fatalf("encoding/json does not read %s as one intent: %v", message, err)
+	}
+	return parsed.SignerID, parsed.Intents[0].Intent, parsed.Intents[0].Tokens
+}
+
+const (
+	// What the on-chain verifier would execute: 5000 USDC to the attacker, against a debit of 100.
+	realIntent = `{"intent":"transfer","receiver_id":"attacker.example","tokens":{"usdc-base":"5000000000"}}`
+	// What a case-insensitive, last-key-wins reader is shown instead: 10, within the debit.
+	decoyIntent = `{"intent":"transfer","receiver_id":"receiver.example","tokens":{"usdc-base":"10"}}`
+)
+
+// The audit's payload, and every other place it fits. encoding/json reads the decoy in each — that
+// is asserted first — while the digest binds the exact text and the case-sensitive verifier on
+// chain executes the real transfer. The guard must refuse every one before a share exists.
+func TestBlindSignGuardRefusesADecoyBehindASecondSpelling(t *testing.T) {
+	signer := `"signer_id":"` + guardSigner + `"`
+	for name, message := range map[string]string{
+		"Intents after intents": `{` + signer + `,"intents":[` + realIntent + `],"Intents":[` + decoyIntent + `]}`,
+		"INTENTS after intents": `{` + signer + `,"intents":[` + realIntent + `],"INTENTS":[` + decoyIntent + `]}`,
+		// Another vault's signer under the exact key, this vault's under a second spelling.
+		"Signer_id after signer_id": `{"signer_id":"ffff","intents":[` + decoyIntent + `],"Signer_id":"` + guardSigner + `"}`,
+		// U+017F, LATIN SMALL LETTER LONG S: encoding/json folds it to "S".
+		"long-s signer_id": `{"signer_id":"ffff","intents":[` + decoyIntent + `],"ſigner_id":"` + guardSigner + `"}`,
+		"Tokens after tokens": `{` + signer + `,"intents":[{"intent":"transfer","receiver_id":"attacker.example",` +
+			`"tokens":{"usdc-base":"5000000000"},"Tokens":{"usdc-base":"10"}}]}`,
+		// U+212A, KELVIN SIGN: folds to "K".
+		"kelvin-sign tokens": `{` + signer + `,"intents":[{"intent":"transfer","receiver_id":"attacker.example",` +
+			`"tokens":{"usdc-base":"5000000000"},"to` + "K" + `ens":{"usdc-base":"10"}}]}`,
+		// A withdrawal the chain executes, read as a transfer.
+		"Intent after intent": `{` + signer + `,"intents":[{"intent":"ft_withdraw","token":"usdc-base",` +
+			`"receiver_id":"attacker.example","amount":"5000000000","Intent":"transfer","tokens":{"usdc-base":"10"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			gotSigner, gotIntent, gotTokens := legacyRead(t, message)
+			if gotSigner != guardSigner || gotIntent != "transfer" || len(gotTokens) != 1 || gotTokens[guardToken] != "10" {
+				t.Fatalf("not a decoy: encoding/json reads signer %q intent %q tokens %v", gotSigner, gotIntent, gotTokens)
+			}
+			p, d := guardSource(t, message, 5)
+			err := verifySigningDisclosure(guardQuote(), []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint)
+			if err == nil || !strings.Contains(err.Error(), "co-sign refused") {
+				t.Fatalf("a message that reads two ways must be refused, got %v", err)
+			}
+		})
+	}
+}
+
+// A key that appears twice in one object is refused wherever the guard reads: the message, its
+// intent, its tokens, the disclosure around it, the signing package, the vault's own key package.
+// Spelled with an escape, "intents" is still "intents".
+func TestBlindSignGuardRefusesARepeatedKey(t *testing.T) {
+	signer := `"signer_id":"` + guardSigner + `"`
+	quote := guardQuote()
+	for name, message := range map[string]string{
+		"intents twice":         `{` + signer + `,"intents":[` + realIntent + `],"intents":[` + decoyIntent + `]}`,
+		"intents escaped":       `{` + signer + `,"intents":[` + realIntent + `],"intents":[` + decoyIntent + `]}`,
+		"signer_id twice":       `{"signer_id":"ffff","intents":[` + decoyIntent + `],` + signer + `}`,
+		"intent twice":          `{` + signer + `,"intents":[{"intent":"ft_withdraw","intent":"transfer","tokens":{"usdc-base":"10"}}]}`,
+		"tokens twice":          `{` + signer + `,"intents":[{"intent":"transfer","tokens":{"usdc-base":"5000000000"},"tokens":{"usdc-base":"10"}}]}`,
+		"one token twice":       `{` + signer + `,"intents":[{"intent":"transfer","tokens":{"usdc-base":"5000000000","usdc-base":"10"}}]}`,
+		"deeper, unread field":  `{` + signer + `,"intents":[{"intent":"transfer","tokens":{"usdc-base":"10"},"memo":{"a":1,"a":2}}]}`,
+		"trailing second value": `{` + signer + `,"intents":[` + decoyIntent + `]} {"intents":[]}`,
+	} {
+		p, d := guardSource(t, message, 6)
+		err := verifySigningDisclosure(quote, []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint)
+		if err == nil || !strings.Contains(err.Error(), "co-sign refused") {
+			t.Errorf("%s: want a refusal, got %v", name, err)
+		}
+	}
+
+	honest := transferMessage(guardSigner, map[string]string{guardToken: "10"})
+	p, d := guardSource(t, honest, 7)
+	var pkg map[string]string
+	_ = json.Unmarshal(p, &pkg)
+	nonce := make([]byte, 32)
+	nonce[0] = 7
+	other, _ := PayloadDigestHex(transferMessage(guardSigner, map[string]string{guardToken: "11"}), nonce, guardRecipient, "")
+	quoted, _ := json.Marshal(honest)
+	nonceHex := hex.EncodeToString(nonce)
+
+	for name, tc := range map[string]struct{ pkg, disc, kp string }{
+		"disclosure message twice": {string(p),
+			`{"message":` + string(quoted) + `,"nonce":"` + nonceHex + `","recipient":"` + guardRecipient + `","message":"{}"}`, guardKeyPkg},
+		"disclosure Message": {string(p),
+			`{"message":` + string(quoted) + `,"nonce":"` + nonceHex + `","recipient":"` + guardRecipient + `","Message":"{}"}`, guardKeyPkg},
+		"disclosure Recipient": {string(p),
+			`{"message":` + string(quoted) + `,"nonce":"` + nonceHex + `","recipient":"` + guardRecipient + `","Recipient":"x"}`, guardKeyPkg},
+		"package message twice": {`{"message":"` + other + `","message":"` + pkg["message"] + `"}`, string(d), guardKeyPkg},
+		"package Message":       {`{"message":"` + other + `","Message":"` + pkg["message"] + `"}`, string(d), guardKeyPkg},
+		"key package twice":     {string(p), string(d), `{"verifying_key":"FFFF","verifying_key":"AB12CD34"}`},
+		"key package Verifying": {string(p), string(d), `{"verifying_key":"FFFF","Verifying_key":"AB12CD34"}`},
+	} {
+		err := verifySigningDisclosure(quote, []json.RawMessage{json.RawMessage(tc.pkg)},
+			[]json.RawMessage{json.RawMessage(tc.disc)}, tc.kp, guardFingerprint)
+		if err == nil || !strings.Contains(err.Error(), "co-sign refused") {
+			t.Errorf("%s: want a refusal, got %v", name, err)
+		}
+	}
+
+	// The same honest source, unaltered, still signs: the refusals above are about the second key.
+	if err := verifySigningDisclosure(quote, []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint); err != nil {
+		t.Fatalf("the honest source must pass: %v", err)
+	}
+}
+
+// A message shaped exactly as the server builds it (the server's Nep413Signer.BuildTransferIntentMessage:
+// deadline, one transfer with receiver_id and tokens, signer_id last), escapes included, still signs.
+func TestBlindSignGuardAcceptsTheServersMessageShape(t *testing.T) {
+	message := `{"deadline":"2026-01-01T00:00:00.000Z","intents":[{"intent":"transfer",` +
+		`"receiver_id":"deposit\"route\\.example","tokens":{"usdc-base":"100"}}],"signer_id":"` + guardSigner + `"}`
+	p, d := guardSource(t, message, 8)
+	if err := verifySigningDisclosure(guardQuote(), []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint); err != nil {
+		t.Fatalf("the server's own message shape must sign: %v", err)
+	}
+}
+
+// The sign/begin envelope is read by a case-insensitive struct decode, which is only trustworthy
+// once no key it reads is repeated or spelled twice.
+func TestSignBeginEnvelopeMustBeUnambiguous(t *testing.T) {
+	keys := []string{"signing_packages", "messages", "token"}
+	if err := requireStrictKeys([]byte(`{"token":"t","signing_packages":[],"messages":[],"extra":{"x":1}}`), keys...); err != nil {
+		t.Fatalf("an honest envelope must pass: %v", err)
+	}
+	for _, body := range []string{
+		`{"token":"t","signing_packages":[],"messages":[],"Messages":[]}`,
+		`{"token":"t","signing_packages":[],"Signing_Packages":[],"messages":[]}`,
+		`{"token":"t","token":"u","signing_packages":[],"messages":[]}`,
+		`{"token":"t","signing_packages":[],"messages":[{"message":"a","message":"b"}]}`,
+		`[]`,
+		`not json`,
+	} {
+		if err := requireStrictKeys([]byte(body), keys...); err == nil {
+			t.Errorf("%s: want a refusal", body)
+		}
+	}
+}
+
+// The strict reader recurses per bracket and json.Decoder.Token enforces no depth, so the reader
+// enforces one: a server-written message nested a million deep is a refusal, not a goroutine
+// stack the runtime aborts the whole process over.
+func TestStrictParseRefusesNestingPastItsLimit(t *testing.T) {
+	nest := func(n int) string { return strings.Repeat("[", n) + strings.Repeat("]", n) }
+	if _, err := strictParse([]byte(nest(strictMaxDepth))); err != nil {
+		t.Fatalf("%d levels is within the limit: %v", strictMaxDepth, err)
+	}
+	if _, err := strictParse([]byte(nest(strictMaxDepth + 1))); err == nil || !strings.Contains(err.Error(), "nested deeper") {
+		t.Fatalf("%d levels must be refused, got %v", strictMaxDepth+1, err)
+	}
+
+	deep := `{"signer_id":"` + guardSigner + `","intents":[` + decoyIntent + `],"memo":` + nest(1<<20) + `}`
+	p, d := guardSource(t, deep, 9)
+	err := verifySigningDisclosure(guardQuote(), []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint)
+	if err == nil || !strings.Contains(err.Error(), "co-sign refused: unreadable message") || !strings.Contains(err.Error(), "nested deeper") {
+		t.Fatalf("a million-deep message must be the guard's refusal, got %v", err)
+	}
+	// The same message at an ordinary depth signs.
+	ordinary := `{"signer_id":"` + guardSigner + `","intents":[` + decoyIntent + `],"memo":` + nest(8) + `}`
+	p, d = guardSource(t, ordinary, 9)
+	if err := verifySigningDisclosure(guardQuote(), []json.RawMessage{p}, []json.RawMessage{d}, guardKeyPkg, guardFingerprint); err != nil {
+		t.Fatalf("an ordinary depth must pass: %v", err)
+	}
+	// A disclosure envelope or a sign/begin answer nested past the limit is refused the same way.
+	if err := requireStrictKeys([]byte(`{"messages":`+nest(1<<16)+`}`), "messages"); err == nil {
+		t.Fatal("a deep sign/begin answer must be refused")
+	}
+}
+
+func TestStrictParse(t *testing.T) {
+	v, err := strictParse([]byte(` {"a":[1,"2",true,null,{"b":12345678901234567890123}],"A":0} `))
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := v.(strictObject)
+	if len(obj) != 2 {
+		t.Fatalf("keys are kept exactly as written, case included: %v", obj)
+	}
+	big := obj["a"].([]any)[4].(strictObject)["b"]
+	if n, ok := big.(json.Number); !ok || n.String() != "12345678901234567890123" {
+		t.Fatalf("a number stays its exact digits, never a float: %#v", big)
+	}
+	if _, _, err := obj.field("a"); err == nil {
+		t.Fatal(`"A" next to "a" must make "a" ambiguous`)
+	}
+	for _, bad := range []string{`{"a":1,"a":1}`, `{"a":1}{}`, `{"a":1,}`, `{a:1}`, `{"a":1`, ``} {
+		if _, err := strictParse([]byte(bad)); err == nil {
+			t.Errorf("%q must not parse", bad)
+		}
+	}
+}
+
+// Every response the real server recorded parses under the strict reader — whole files, and the
+// message sign_begin.json discloses inside a string — so the strictness costs no legitimate
+// answer. The recorded disclosure is still refused, and for the reason it always was (its nonce is
+// a placeholder, not 32 bytes), not because it reads two ways.
+func TestEveryContractFixtureParsesStrictly(t *testing.T) {
+	entries, err := os.ReadDir(fixturesDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if _, err := strictParse(readFixtureFile(t, e.Name())); err != nil {
+			t.Errorf("%s: %v", e.Name(), err)
+		}
+	}
+
+	var begin struct {
+		SigningPackages []json.RawMessage `json:"signing_packages"`
+		Messages        []json.RawMessage `json:"messages"`
+	}
+	raw := loadFixture(t, "sign_begin.json").Response.Body
+	if err := requireStrictKeys(raw, "signing_packages", "messages", "token"); err != nil {
+		t.Fatalf("sign_begin.json: %v", err)
+	}
+	if err := json.Unmarshal(raw, &begin); err != nil || len(begin.Messages) != 1 {
+		t.Fatalf("sign_begin.json: %v", err)
+	}
+	disc, err := strictParseObject(begin.Messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := disc.stringField("message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := strictParseObject([]byte(message)); err != nil {
+		t.Fatalf("the disclosed message %s: %v", message, err)
+	}
+	err = verifySigningDisclosure(guardQuote(), begin.SigningPackages, begin.Messages, guardKeyPkg, guardFingerprint)
+	if err == nil || !strings.Contains(err.Error(), "nonce must be 32 bytes") {
+		t.Fatalf("the recorded placeholder disclosure is refused for its nonce, got %v", err)
+	}
+}
+
+// A pin that pins nothing is refused when the wallet is built. It used to be dropped, which left
+// the label on the server's own published fingerprint — the value the pin was there to replace.
+func TestPinnedFingerprintsRefusesAnEmptyOrMalformedPin(t *testing.T) {
+	secret := PackSecret("vk_live_contract", 7, "")
+	for name, pins := range map[string]map[string][]string{
+		"no fingerprint":   {"USDC@base": {}},
+		"nil list":         {"USDC@base": nil},
+		"empty string":     {"USDC@base": {""}},
+		"blank":            {"USDC@base": {"   "}},
+		"one empty of two": {"USDC@base": {tokenFingerprint(guardToken), ""}},
+		"not hex":          {"USDC@base": {strings.Repeat("z", 64)}},
+		"too short":        {"USDC@base": {"a42c7e46"}},
+		"0x prefixed":      {"USDC@base": {"0x" + tokenFingerprint(guardToken)}},
+	} {
+		w, err := NewWallet(secret, "https://vault.test", 0, PinnedFingerprints(pins))
+		if err == nil || w != nil || !strings.Contains(err.Error(), "PinnedFingerprints") {
+			t.Errorf("%s: want a construction error, got %v, %v", name, w, err)
+		}
+	}
+	upper := strings.ToUpper(tokenFingerprint(guardToken))
+	w, err := NewWallet(secret, "https://vault.test", 0, PinnedFingerprints(map[string][]string{"USDC@base": {" " + upper + " "}}))
+	if err != nil || len(w.pinned["USDC@base"]) != 1 || w.pinned["USDC@base"][0] != tokenFingerprint(guardToken) {
+		t.Fatalf("a well-formed pin, any case, surrounding space trimmed, must construct: %v", err)
 	}
 }
 

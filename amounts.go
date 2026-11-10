@@ -33,6 +33,11 @@ func stripLeadingZeros(s string) string {
 
 // ParseUnits converts "1.5" with 6 decimals to "1500000". It rejects anything that is not a
 // non-negative decimal.
+//
+// It is for comparing a human figure with a raw amount from a response — never for building the
+// amount of QuoteSwap, QuoteWithdraw, Swap or Withdraw, or a MinReceive / MaxDebit option: those
+// take the human string itself and the server scales it. Withdraw("USDC@base", "10000", …) — what
+// ParseUnits("0.01", 6) returns — pays out 10 000 USDC.
 func ParseUnits(human string, decimals int) (string, error) {
 	if decimals < 0 {
 		return "", localError("decimals must be >= 0")
@@ -49,8 +54,8 @@ func ParseUnits(human string, decimals int) (string, error) {
 	return stripLeadingZeros(whole + frac + strings.Repeat("0", decimals-len(frac))), nil
 }
 
-// FormatUnits converts "1500000" with 6 decimals back to "1.5". Trailing zeros in the fraction
-// are dropped.
+// FormatUnits converts "1500000" with 6 decimals back to "1.5" — a raw amount from a response, as
+// a human decimal. Trailing zeros in the fraction are dropped.
 func FormatUnits(raw string, decimals int) (string, error) {
 	sign := ""
 	digits := raw

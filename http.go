@@ -29,7 +29,7 @@ const defaultTimeout = 60 * time.Second
 
 type httpTransport struct {
 	baseURL string
-	apiKey  string
+	apiKey  sealedString // never a plain string field: see sealedSecret
 	client  *http.Client
 }
 
@@ -39,13 +39,20 @@ func newHTTP(baseURL, apiKey string, timeout time.Duration) *httpTransport {
 	}
 	return &httpTransport{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
+		apiKey:  sealString(apiKey),
 		client:  &http.Client{Timeout: timeout},
 	}
 }
 
 // maxRawMessage caps how much of a non-JSON body becomes an error message.
 const maxRawMessage = 300
+
+// maxResponseBytes caps how much of any response body is read. The largest answer the vault API
+// gives is a movements page: the server clamps limit to 100 rows (VaultApiEndpoints, GET
+// /movements) at well under a kilobyte each, so about 100 KB; a sign/begin answer is around a
+// kilobyte per source. The server is exactly the party the co-sign guard does not trust, and a body
+// read whole without a cap is memory it chooses. 8 MiB is eighty times the largest legitimate one.
+const maxResponseBytes = 8 << 20
 
 // looksLikeHTML spots a page served where the API should have answered — a proxy's 404, a site's
 // fallback route. Echoing that page back as the error message helps nobody.
@@ -127,15 +134,20 @@ func raiseFor(status int, body map[string]any, text, contentType, retryAfterHead
 }
 
 func (h *httpTransport) do(req *http.Request) (json.RawMessage, error) {
-	req.Header.Set("authorization", "Bearer "+h.apiKey)
+	req.Header.Set("authorization", "Bearer "+h.apiKey())
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return nil, newError(KindGeneral, 0, "transport error: %v", err)
 	}
 	defer resp.Body.Close()
-	text, err := io.ReadAll(resp.Body)
+	text, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, newError(KindGeneral, 0, "transport error: %v", err)
+	}
+	if len(text) > maxResponseBytes {
+		return nil, newError(KindGeneral, resp.StatusCode,
+			"the server answered %d with a body over %d bytes; no vault API response is that large — refusing to read it",
+			resp.StatusCode, maxResponseBytes)
 	}
 	var body map[string]any
 	if len(text) > 0 {

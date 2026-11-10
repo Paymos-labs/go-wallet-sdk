@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/url"
 	"os"
@@ -34,23 +36,38 @@ var terminalStatuses = map[string]bool{
 const defaultBaseURL = "https://wallet.paymos.io"
 
 // SwapOptions are the optional knobs of Wallet.Swap. Zero values mean "the SDK default".
+//
+// SlippageBps: 0 — the zero value — means the DEFAULT 50 bps (0.5%), NOT zero slippage, and so does
+// any negative value. This SDK cannot tell an unset field from an explicit 0, so SwapOptions{} and
+// SwapOptions{SlippageBps: 0} both send 50. The other seven SDKs send 0 as 0; here the tightest
+// tolerance you can ask for is SlippageBps: 1. (Changing what 0 sends now would change what every
+// existing SwapOptions{} call sends.)
 type SwapOptions struct {
-	SlippageBps    int    // default 50 (= 0.5%)
+	SlippageBps    int    // default 50 (= 0.5%); 0 and below also mean 50 — see above
 	MinReceive     string // human decimal floor on the quote's minimum receive (receive.min)
 	MaxDebit       string // human decimal ceiling on the total vault debit
-	IdempotencyKey string // a durable payout id; a fresh one is generated when empty
+	IdempotencyKey string // a durable payout id — see IdempotencyKey on WithdrawOptions
 }
 
 // WithdrawOptions are the optional knobs of Wallet.Withdraw. Zero values mean "the SDK default".
+//
+// IdempotencyKey (here and on SwapOptions): set it to a durable id (a payout or job id) and a retry
+// under the same key replays the same movement instead of paying twice. Left empty, a fresh key is
+// generated per call — Go cannot tell an unset field from an explicit "" — so a retry is a NEW
+// payment. A key of only whitespace is refused: sent, the server reads it as no key at all.
 type WithdrawOptions struct {
 	Mode           string // "exact_out" (default) or "total_in"
 	MaxDebit       string // human decimal ceiling on the total vault debit
-	IdempotencyKey string // a durable payout id; a fresh one is generated when empty
+	IdempotencyKey string // a durable payout id; empty means a fresh key per call (no dedup across retries)
 }
 
 // Wallet controls one vault. Construct with NewWallet or FromEnv. Not safe to copy after use.
+//
+// Printed with any fmt verb it shows the vault id, whether it holds a share and the key's vk_live_
+// prefix — never the key or the share. Even a copy of the struct, walked field by field by
+// reflection, cannot reach either (see sealedSecret).
 type Wallet struct {
-	secret     VaultSecret
+	secret     sealedSecret
 	http       *httpTransport
 	assetMu    sync.Mutex
 	assetList  []Asset
@@ -58,6 +75,9 @@ type Wallet struct {
 	// pinned maps an asset label to the fingerprints the caller trusts for it, lowercased. A pinned
 	// label ignores whatever /assets publishes for it.
 	pinned map[string][]string
+	// configErr is the first error an Option reported. Option is func(*Wallet) and cannot return
+	// one, so NewWallet does.
+	configErr error
 }
 
 // Option configures a Wallet at construction.
@@ -72,24 +92,40 @@ type Option func(*Wallet)
 // server that builds the messages, so a fully compromised server could publish a false one. A pin
 // is a trust anchor that does not depend on the server: for a pinned label the co-sign accepts ONLY
 // the pinned values and ignores /assets. Unpinned labels keep using the published set. Values are
-// compared case-insensitively; a label pinned to an empty list is ignored.
+// compared case-insensitively.
+//
+// A malformed pin is refused when the wallet is built — NewWallet returns the error: a label with
+// no fingerprint, an empty one, or anything but 64 hex characters. An empty pin used to be dropped
+// silently, which left the label on the server's published fingerprint: the very value the pin was
+// there to stop trusting.
 func PinnedFingerprints(pins map[string][]string) Option {
 	return func(w *Wallet) {
 		for label, fps := range pins {
-			var lowered []string
-			for _, fp := range fps {
-				if fp = strings.ToLower(strings.TrimSpace(fp)); fp != "" {
-					lowered = append(lowered, fp)
-				}
+			if len(fps) == 0 {
+				w.refuse(localError("PinnedFingerprints[%q] pins no fingerprint — pin one, or leave the label out", label))
+				return
 			}
-			if len(lowered) == 0 {
-				continue
+			lowered := make([]string, 0, len(fps))
+			for _, fp := range fps {
+				fp = strings.ToLower(strings.TrimSpace(fp))
+				if _, err := hex.DecodeString(fp); len(fp) != 64 || err != nil {
+					w.refuse(localError("PinnedFingerprints[%q]: %q is not a 64-character hex SHA-256 fingerprint", label, fp))
+					return
+				}
+				lowered = append(lowered, fp)
 			}
 			if w.pinned == nil {
 				w.pinned = map[string][]string{}
 			}
 			w.pinned[label] = lowered
 		}
+	}
+}
+
+// refuse records the first configuration error an Option meets.
+func (w *Wallet) refuse(err error) {
+	if w.configErr == nil {
+		w.configErr = err
 	}
 }
 
@@ -106,12 +142,37 @@ func NewWallet(secret, baseURL string, timeout time.Duration, opts ...Option) (*
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	w := &Wallet{secret: s, http: newHTTP(baseURL, s.APIKey, timeout)}
+	w := &Wallet{secret: sealSecret(s), http: newHTTP(baseURL, s.APIKey, timeout)}
 	for _, opt := range opts {
 		opt(w)
 	}
+	if w.configErr != nil {
+		return nil, w.configErr
+	}
 	return w, nil
 }
+
+// String describes the wallet without its secret: vault id, whether it holds a share, the key's
+// non-secret vk_live_ prefix and the base URL.
+func (w *Wallet) String() string {
+	if w == nil || w.secret == nil {
+		return "Wallet(<unconfigured>)"
+	}
+	s := w.secret()
+	base := ""
+	if w.http != nil {
+		base = w.http.baseURL
+	}
+	return fmt.Sprintf("Wallet(vaultId=%d, hasShare=%v, apiKey=%s, baseURL=%s)",
+		s.VaultID, s.HasShare(), maskKey(s.APIKey), base)
+}
+
+// GoString is String: %#v must not print the fields either.
+func (w *Wallet) GoString() string { return w.String() }
+
+// Format makes every fmt verb print String — %+v and %#v included, which would otherwise walk the
+// struct and print the secret's fields.
+func (w *Wallet) Format(f fmt.State, verb rune) { formatRedacted(f, verb, w.String()) }
 
 // FromEnv reads PAYMOS_VAULT_SECRET, the way a deployed process is configured.
 func FromEnv(opts ...Option) (*Wallet, error) {
@@ -238,6 +299,13 @@ func (w *Wallet) Wait(movementID string, timeout, interval time.Duration) (*Move
 // ── quotes ───────────────────────────────────────────────────────────────────
 
 // QuoteSwap is a dry preview. Nothing is created and nothing is signed.
+//
+// amount is a HUMAN decimal string in the send asset ("100", "0.5"); the server scales it by the
+// asset's decimals. The quote that comes back carries raw integer strings. Never pass ParseUnits
+// output here: "10000" is ten thousand of the asset, not 0.01.
+//
+// slippageBps of 0 or less means the default 50 bps (0.5%), not zero slippage — the same rule as
+// SwapOptions.SlippageBps, so a preview quotes what the swap would send.
 func (w *Wallet) QuoteSwap(send, receive, amount string, slippageBps int) (*Quote, error) {
 	if slippageBps <= 0 {
 		slippageBps = 50
@@ -252,6 +320,9 @@ func (w *Wallet) QuoteSwap(send, receive, amount string, slippageBps int) (*Quot
 }
 
 // QuoteWithdraw is a dry preview. Nothing is created and nothing is signed.
+//
+// amount is a HUMAN decimal string in asset ("25", "0.01"); the server scales it. The quote that
+// comes back carries raw integer strings. Never pass ParseUnits output here.
 func (w *Wallet) QuoteWithdraw(asset, amount, to, mode string) (*Quote, error) {
 	if mode == "" {
 		mode = "exact_out"
@@ -267,8 +338,16 @@ func (w *Wallet) QuoteWithdraw(asset, amount, to, mode string) (*Quote, error) {
 // ── money ────────────────────────────────────────────────────────────────────
 
 // Swap creates a real movement and drives the 2-of-2 co-sign. Full-key secrets only.
+//
+// amount, like opts.MinReceive and opts.MaxDebit, is a HUMAN decimal string ("100", "0.5") that the
+// server scales by the asset's decimals — never ParseUnits output, which would be read as that many
+// whole units. Swap("USDC@base", "USDT@base", "10000", …) swaps ten thousand USDC.
 func (w *Wallet) Swap(send, receive, amount string, opts SwapOptions) (*Movement, error) {
 	if err := w.requireShare("swap"); err != nil {
+		return nil, err
+	}
+	idem, err := idempotencyKeyOf(opts.IdempotencyKey)
+	if err != nil {
 		return nil, err
 	}
 	sendDec, err := w.validateAmount(amount, send)
@@ -282,10 +361,6 @@ func (w *Wallet) Swap(send, receive, amount string, opts SwapOptions) (*Movement
 	slippageBps := opts.SlippageBps
 	if slippageBps <= 0 {
 		slippageBps = 50
-	}
-	idem := opts.IdempotencyKey
-	if idem == "" {
-		idem = freshIdempotencyKey()
 	}
 
 	q, err := w.quote("/vault/v1/quote/swap", swapBody(send, receive, amount, slippageBps), false, idem)
@@ -331,8 +406,17 @@ func (w *Wallet) Swap(send, receive, amount string, opts SwapOptions) (*Movement
 }
 
 // Withdraw creates a real payout movement and drives the 2-of-2 co-sign. Full-key secrets only.
+//
+// amount, like opts.MaxDebit, is a HUMAN decimal string ("25", "0.01") that the server scales by
+// the asset's decimals — never ParseUnits output. Withdraw("USDC@base", "10000", …), which is what
+// ParseUnits("0.01", 6) returns, pays out ten thousand USDC; the SDK and the server agree on that
+// number, so no check can tell it from an intended one.
 func (w *Wallet) Withdraw(asset, amount, to string, opts WithdrawOptions) (*Movement, error) {
 	if err := w.requireShare("withdraw"); err != nil {
+		return nil, err
+	}
+	idem, err := idempotencyKeyOf(opts.IdempotencyKey)
+	if err != nil {
 		return nil, err
 	}
 	mode := opts.Mode
@@ -342,10 +426,6 @@ func (w *Wallet) Withdraw(asset, amount, to string, opts WithdrawOptions) (*Move
 	dec, err := w.validateAmount(amount, asset)
 	if err != nil {
 		return nil, err
-	}
-	idem := opts.IdempotencyKey
-	if idem == "" {
-		idem = freshIdempotencyKey()
 	}
 
 	q, err := w.quote("/vault/v1/quote/withdraw", map[string]any{
@@ -394,7 +474,7 @@ func swapBody(send, receive, amount string, slippageBps int) map[string]any {
 }
 
 func (w *Wallet) requireShare(op string) error {
-	if !w.secret.HasShare() {
+	if !w.secret().HasShare() {
 		return localError("%s needs a full-scope secret: this one carries no co-signing share", op)
 	}
 	return nil
@@ -474,7 +554,7 @@ func (w *Wallet) cosign(q *Quote) error {
 		return localError("quote is missing its source count — cannot co-sign")
 	}
 
-	kp := w.secret.Share
+	kp := w.secret().Share
 	if kp == "" {
 		return localError("this secret carries no co-signing share")
 	}
@@ -517,6 +597,12 @@ func (w *Wallet) cosign(q *Quote) error {
 	}
 	if err := json.Unmarshal(beginRaw, &beginTyped); err != nil {
 		return localError("bad wire JSON from sign/begin: %v", err)
+	}
+	// That decode matches keys case-insensitively and keeps the last of a repeated one. Refusing
+	// any repeated or second-spelled key first means it read the exact-case fields, and nothing
+	// else (see strictjson.go).
+	if err := requireStrictKeys(beginRaw, "signing_packages", "messages", "token"); err != nil {
+		return localError("co-sign refused: the sign/begin answer is ambiguous: %v", err)
 	}
 	packages := beginTyped.SigningPackages
 	if len(packages) != n {
@@ -706,6 +792,13 @@ func tokenFingerprint(tokenID string) string {
 // binds the token to the fingerprint the server publishes (or the caller pinned): against
 // published values it catches a server bug or a compromised signing path; only a pin holds against
 // a fully compromised server, which could publish a false fingerprint.
+//
+// Every object it reads — the key package, each disclosure, each signing package, the message and
+// its intent — goes through strictParse and exact-case lookups, never encoding/json's struct
+// decode: that decode matches keys case-insensitively and keeps the last of a repeated one, so a
+// message carrying "intents" and then "Intents" would show this guard the second list while the
+// case-sensitive verifier on chain executes the first. A repeated key, or a second spelling of a
+// key read here, is refused.
 func verifySigningDisclosure(q *Quote, packages, messages []json.RawMessage, keyPackage string, sendFingerprints []string) error {
 	if len(messages) != len(packages) {
 		return localError("co-sign refused: the server did not disclose the signing messages — refusing to blind-sign")
@@ -713,85 +806,54 @@ func verifySigningDisclosure(q *Quote, packages, messages []json.RawMessage, key
 	if len(sendFingerprints) == 0 {
 		return localError("co-sign refused: the server did not publish an asset fingerprint — update the server")
 	}
-	var kp struct {
-		VerifyingKey string `json:"verifying_key"`
-	}
-	_ = json.Unmarshal([]byte(keyPackage), &kp)
-	expectedSigner := strings.ToLower(kp.VerifyingKey)
-	if expectedSigner == "" {
-		// Without the vault's own key there is nothing to check the signer against, and an
-		// unchecked signer is a transfer from any vault the server likes.
-		return localError("co-sign refused: the vault key package has no verifying key to check the signer against")
+	expectedSigner, err := vaultSigner(keyPackage)
+	if err != nil {
+		return err
 	}
 	total := new(big.Int)
 
 	for i, pkgRaw := range packages {
-		var disc struct {
-			Message   string `json:"message"`
-			Nonce     string `json:"nonce"`
-			Recipient string `json:"recipient"`
+		disc, err := strictParseObject(messages[i])
+		if err != nil {
+			return localError("co-sign refused: malformed disclosure for source %d: %v", i, err)
 		}
-		if err := json.Unmarshal(messages[i], &disc); err != nil ||
-			disc.Message == "" || disc.Nonce == "" || disc.Recipient == "" {
+		message, okMessage, errMessage := disc.stringField("message")
+		nonceHex, okNonce, errNonce := disc.stringField("nonce")
+		recipient, okRecipient, errRecipient := disc.stringField("recipient")
+		if err := errors.Join(errMessage, errNonce, errRecipient); err != nil {
+			return localError("co-sign refused: malformed disclosure for source %d: %v", i, err)
+		}
+		if !okMessage || !okNonce || !okRecipient || message == "" || nonceHex == "" || recipient == "" {
 			return localError("co-sign refused: malformed disclosure for source %d", i)
 		}
 
 		// (1) binding: the package about to be signed hashes to EXACTLY the disclosed message.
-		nonce, err := hex.DecodeString(disc.Nonce)
+		nonce, err := hex.DecodeString(nonceHex)
 		if err != nil {
 			return localError("co-sign refused: bad nonce hex for source %d", i)
 		}
-		want, err := PayloadDigestHex(disc.Message, nonce, disc.Recipient, "")
+		want, err := PayloadDigestHex(message, nonce, recipient, "")
 		if err != nil {
 			return localError("co-sign refused: bad disclosure for source %d: %v", i, err)
 		}
-		var pkg struct {
-			Message string `json:"message"`
+		pkg, err := strictParseObject(pkgRaw)
+		if err != nil {
+			return localError("co-sign refused: signing package %d is unreadable: %v", i, err)
 		}
-		_ = json.Unmarshal(pkgRaw, &pkg)
-		if !strings.EqualFold(pkg.Message, want) {
+		bound, _, err := pkg.stringField("message")
+		if err != nil {
+			return localError("co-sign refused: signing package %d is ambiguous: %v", i, err)
+		}
+		if !strings.EqualFold(bound, want) {
 			return localError("co-sign refused: signing package %d does not bind to the disclosed message", i)
 		}
 
 		// (2) structure and own-vault: one transfer, signed from this vault and no other.
-		var parsed struct {
-			SignerID string `json:"signer_id"`
-			Intents  []struct {
-				Intent string            `json:"intent"`
-				Tokens map[string]string `json:"tokens"`
-			} `json:"intents"`
+		amount, err := verifyTransferMessage(i, message, expectedSigner, sendFingerprints)
+		if err != nil {
+			return err
 		}
-		if err := json.Unmarshal([]byte(disc.Message), &parsed); err != nil {
-			return localError("co-sign refused: unreadable message for source %d: %v", i, err)
-		}
-		if len(parsed.Intents) != 1 || parsed.Intents[0].Intent != "transfer" {
-			return localError("co-sign refused: source %d is not a single transfer", i)
-		}
-		if strings.ToLower(parsed.SignerID) != expectedSigner {
-			return localError("co-sign refused: source %d signs from a different vault", i)
-		}
-		tokens := parsed.Intents[0].Tokens
-		if len(tokens) != 1 {
-			return localError("co-sign refused: source %d does not transfer exactly one token", i)
-		}
-		for tokenID, v := range tokens {
-			// The token, not only the amount: 10.025 of another asset is not the 10.025 USDC that
-			// was approved.
-			if !fingerprintIn(tokenFingerprint(tokenID), sendFingerprints) {
-				return localError("co-sign refused: source %d moves a different token than the approved send asset", i)
-			}
-			// ASCII digits only, and above zero. big.Int accepts a sign: a server could disclose
-			// +2D on one source and -D on another, the total D would pass the debit check, and
-			// the first source alone would move 2D. A transfer amount carries no sign and is never zero.
-			if !isDigits(v) {
-				return localError("co-sign refused: transfer amount for source %d is not a positive integer: %q", i, v)
-			}
-			amount, _ := new(big.Int).SetString(v, 10)
-			if amount.Sign() <= 0 {
-				return localError("co-sign refused: transfer amount for source %d is not a positive integer: %q", i, v)
-			}
-			total.Add(total, amount)
-		}
+		total.Add(total, amount)
 	}
 
 	// (3) no inflation: the sources together move no more than the approved debit.
@@ -803,6 +865,99 @@ func verifySigningDisclosure(q *Quote, packages, messages []json.RawMessage, key
 		return localError("co-sign refused: sources move %s, above the approved debit %s", total, approved)
 	}
 	return nil
+}
+
+// vaultSigner is this vault's group key, lowercased — what every disclosed signer_id must equal.
+// Without it there is nothing to check the signer against, and an unchecked signer is a transfer
+// from any vault the server likes, so its absence refuses.
+func vaultSigner(keyPackage string) (string, error) {
+	noKey := localError("co-sign refused: the vault key package has no verifying key to check the signer against")
+	kp, err := strictParseObject([]byte(keyPackage))
+	if err != nil {
+		return "", noKey
+	}
+	vk, ok, err := kp.stringField("verifying_key")
+	if err != nil {
+		return "", localError("co-sign refused: the vault key package is ambiguous: %v", err)
+	}
+	if !ok || vk == "" {
+		return "", noKey
+	}
+	return strings.ToLower(vk), nil
+}
+
+// verifyTransferMessage checks one disclosed message: a single transfer intent, signed from this
+// vault, moving exactly one token whose id hashes to one of sendFingerprints, by a positive
+// amount — which it returns. The message is read with strictParse and exact-case lookups, the way
+// the on-chain verifier reads it.
+func verifyTransferMessage(i int, message, expectedSigner string, sendFingerprints []string) (*big.Int, error) {
+	root, err := strictParseObject([]byte(message))
+	if err != nil {
+		return nil, localError("co-sign refused: unreadable message for source %d: %v", i, err)
+	}
+	signerID, hasSigner, errSigner := root.stringField("signer_id")
+	intentsRaw, _, errIntents := root.field("intents")
+	if err := errors.Join(errSigner, errIntents); err != nil {
+		return nil, localError("co-sign refused: unreadable message for source %d: %v", i, err)
+	}
+	intents, _ := intentsRaw.([]any)
+	if len(intents) != 1 {
+		return nil, localError("co-sign refused: source %d is not a single transfer", i)
+	}
+	intent, isObject := intents[0].(strictObject)
+	if !isObject {
+		return nil, localError("co-sign refused: source %d is not a single transfer", i)
+	}
+	kind, _, errKind := intent.stringField("intent")
+	tokensRaw, _, errTokens := intent.field("tokens")
+	if err := errors.Join(errKind, errTokens); err != nil {
+		return nil, localError("co-sign refused: unreadable message for source %d: %v", i, err)
+	}
+	if kind != "transfer" {
+		return nil, localError("co-sign refused: source %d is not a single transfer", i)
+	}
+	if !hasSigner || strings.ToLower(signerID) != expectedSigner {
+		return nil, localError("co-sign refused: source %d signs from a different vault", i)
+	}
+	tokens, _ := tokensRaw.(strictObject)
+	if len(tokens) != 1 {
+		return nil, localError("co-sign refused: source %d does not transfer exactly one token", i)
+	}
+	for tokenID, value := range tokens {
+		// The token, not only the amount: 10.025 of another asset is not the 10.025 USDC that
+		// was approved.
+		if !fingerprintIn(tokenFingerprint(tokenID), sendFingerprints) {
+			return nil, localError("co-sign refused: source %d moves a different token than the approved send asset", i)
+		}
+		// A JSON string of ASCII digits, above zero. big.Int accepts a sign: a server could
+		// disclose +2D on one source and -D on another, the total D would pass the debit check,
+		// and the first source alone would move 2D. A transfer amount carries no sign and is
+		// never zero; a JSON number is not what the server builds either.
+		v, isString := value.(string)
+		if !isString || !isDigits(v) {
+			return nil, localError("co-sign refused: transfer amount for source %d is not a positive integer: %v", i, value)
+		}
+		amount, _ := new(big.Int).SetString(v, 10)
+		if amount.Sign() <= 0 {
+			return nil, localError("co-sign refused: transfer amount for source %d is not a positive integer: %q", i, v)
+		}
+		return amount, nil
+	}
+	return nil, localError("co-sign refused: source %d does not transfer exactly one token", i) // unreachable
+}
+
+// idempotencyKeyOf is the key a money call is sent under. "" — the zero value, which Go cannot
+// tell from an explicit "" — is "none given" and gets a fresh key. A key of only whitespace is
+// refused: sent, the server reads it as no key at all, and a retry would pay again while the caller
+// believed it deduplicated.
+func idempotencyKeyOf(key string) (string, error) {
+	if key == "" {
+		return freshIdempotencyKey(), nil
+	}
+	if strings.TrimSpace(key) == "" {
+		return "", localError("IdempotencyKey is blank — pass a durable key (a payout or job id) so a retry replays the same movement, or leave it empty for a fresh one per call")
+	}
+	return key, nil
 }
 
 // freshIdempotencyKey returns uuid-v4-shaped hex without the dashes — the shape the other SDKs

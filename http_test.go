@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +125,53 @@ func TestFallsBackToRawBodyWithoutEnvelope(t *testing.T) {
 	errors.As(err, &pe)
 	if pe.Message != "upstream exploded" {
 		t.Fatalf("message = %q", pe.Message)
+	}
+}
+
+// A body is read up to maxResponseBytes and no further: one byte past it is a typed error, never a
+// buffer the server sized. Exactly at the limit still reads.
+func TestRefusesABodyLargerThanAnyVaultAPIResponse(t *testing.T) {
+	w, _ := walletOver(t, 200, "["+strings.Repeat(" ", maxResponseBytes-1)+"]", nil)
+	_, err := w.Balances()
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Kind != KindGeneral || pe.Status != 200 || !strings.Contains(pe.Message, "refusing to read it") {
+		t.Fatalf("an oversized body must be a typed refusal, got %v", err)
+	}
+
+	w, _ = walletOver(t, 200, "["+strings.Repeat(" ", maxResponseBytes-2)+"]", nil)
+	if list, err := w.Balances(); err != nil || len(list) != 0 {
+		t.Fatalf("a body exactly at the limit must read: %v, %v", list, err)
+	}
+}
+
+// "" is the zero value and means "generate one"; a key of only whitespace — which the server
+// would read as no key at all — is refused before anything reaches the server.
+func TestABlankIdempotencyKeyIsRefusedBeforeAnyRequest(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests++ }))
+	defer srv.Close()
+	w, err := NewWallet(PackSecret("vk_live_x", 1, `{"verifying_key":"ab"}`), srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{" ", "\t", " \n "} {
+		if _, err := w.Withdraw("USDC@base", "10", "0xabc", WithdrawOptions{IdempotencyKey: key}); err == nil ||
+			!strings.Contains(err.Error(), "IdempotencyKey is blank") {
+			t.Errorf("withdraw with %q: want a refusal, got %v", key, err)
+		}
+		if _, err := w.Swap("USDC@base", "USDT@base", "5", SwapOptions{IdempotencyKey: key}); err == nil ||
+			!strings.Contains(err.Error(), "IdempotencyKey is blank") {
+			t.Errorf("swap with %q: want a refusal, got %v", key, err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("%d requests reached the server", requests)
+	}
+	if a, _ := idempotencyKeyOf(""); len(a) != 32 {
+		t.Fatalf("an empty key is a fresh one: %q", a)
+	}
+	if k, err := idempotencyKeyOf(" payout-42 "); err != nil || k != " payout-42 " {
+		t.Fatalf("a given key is sent as given: %q, %v", k, err)
 	}
 }
 

@@ -2,10 +2,14 @@ package paymos
 
 // The read model, ported field-for-field from the Python SDK.
 //
-// Every amount is a STRING of raw integer units, never a number. A token with 18 decimals runs
-// past what an IEEE 754 double holds exactly, so a JSON parser that produced numbers here would
-// round somebody's balance without saying so. Use FormatUnits to show one and ParseUnits to build
-// one.
+// Every amount IN THESE RESPONSE TYPES is a STRING of raw integer units, never a number. A token
+// with 18 decimals runs past what an IEEE 754 double holds exactly, so a JSON parser that produced
+// numbers here would round somebody's balance without saying so. FormatUnits shows one as a human
+// decimal; ParseUnits turns a human figure into raw units to COMPARE with one.
+//
+// The amounts you PASS to Wallet are the other way round: human decimal strings ("100", "0.5"),
+// which the server scales. Never pass the output of ParseUnits there — "10000" meant as 0.01 USDC
+// is read as 10 000 USDC.
 
 // Asset is one asset the vault can hold, as the server names it. Fingerprint is the lowercase hex
 // SHA-256 of the asset's raw token id, as the server publishes it; the co-sign checks every

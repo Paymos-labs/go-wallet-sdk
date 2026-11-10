@@ -9,6 +9,7 @@
 // The recipient is not checked: the route's deposit address is chosen by the server.
 //
 // The signing core is the same C ABI build the other SDKs load — downloaded once per platform
-// from the paymos-wallet-core releases, SHA-256-verified, cached per user. Nobody reimplements
-// FROST.
+// from the paymos-wallet-core releases, cached per user, and SHA-256-verified: against the hash
+// compiled into this SDK for the platform when there is one (the cached file too, on every load),
+// otherwise against the checksum published in the same release. Nobody reimplements FROST.
 package paymos

@@ -29,8 +29,11 @@ Requires **Go ≥ 1.22** and cgo (the core is a C ABI library loaded at runtime 
 link-time dependency).
 
 The native co-signing core is **not** inside the module. On first use the SDK downloads the
-pinned, platform-matching build from the `paymos-wallet-core` releases, verifies its SHA-256 against
-the release's checksum, and caches it per user.
+platform-matching build of the core version it is pinned to from the `paymos-wallet-core` releases,
+verifies it, and caches it per user. When this SDK build carries a compiled-in SHA-256 for your
+platform, that hash is the only one accepted — for the download and, re-checked on every load, for
+the cached file. When it carries none, the download is checked against the `.sha256` published in
+the same release, which catches a corrupted download but not a replaced release.
 
 A prebuilt core exists for **Linux x86-64**, **Linux arm64** and **Windows x64**. The SDK also
 recognises macOS on both architectures, but no macOS build is published yet — there is no Mac to
@@ -107,14 +110,26 @@ func main() {
 
 ## Core concepts
 
-**Amounts: human in, raw out.** You pass human decimal strings; the server owns each asset's
-decimals and scales them to raw. Responses come back as raw integer strings. Never a float, in
-either direction. `paymos.ParseUnits` / `paymos.FormatUnits` convert between the two.
+**Amounts: human in, raw out.** Every amount you pass — the `amount` of `QuoteSwap`,
+`QuoteWithdraw`, `Swap` and `Withdraw`, and `MinReceive` / `MaxDebit` — is a human decimal string
+(`"100"`, `"0.5"`); the server owns each asset's decimals and scales it to raw. Every amount in a
+response is a raw integer string (`"10000"` is 0.01 of a 6-decimal USDC). Never a float, in either
+direction. `paymos.FormatUnits` turns a raw response amount into a human one for display;
+`paymos.ParseUnits` turns a human figure into raw units to **compare** with a response amount. It is
+never for building an argument: `w.Withdraw("USDC@base", raw, …)` with `raw` from
+`ParseUnits("0.01", 6)` sends `"10000"` and pays out **10 000 USDC** — and since the SDK and the
+server agree on that number, no check anywhere can tell it from an intended one.
 
 **Moving money.** `Swap` and `Withdraw` (full key only) create a real movement and drive the
 2-of-2 co-sign. Before any signature the SDK re-checks that the server's quote echoes exactly
 the assets and amount you approved — a decimals bug, contract drift, or a quote that differs from
 your request fails the call and **signs nothing**.
+
+**Slippage: `0` means the default, not zero.** `SwapOptions{}` and `SwapOptions{SlippageBps: 0}`
+both send **50 bps (0.5%)**, and so does a negative value; `QuoteSwap(…, 0)` quotes the same 50.
+Go cannot tell an unset field from an explicit `0`, so unlike the other seven SDKs — which send `0`
+as `0` — the tightest tolerance this one can request is `SlippageBps: 1`. Set it explicitly whenever
+the default is not what you mean.
 
 **Safety caps.** `SwapOptions.MinReceive` floors the quote's minimum receive (`KindSlippageExceeded`
 below it, nothing signed); `MaxDebit` ceilings the total vault debit — strongly recommended for
@@ -218,7 +233,9 @@ fingerprint `/assets` publishes for that asset. That fingerprint comes from the 
 check catches a server bug or a compromised signing path, not a fully compromised server. For a
 trust anchor independent of the server, pin fingerprints you obtained out of band —
 `paymos.NewWallet(secret, "", 0, paymos.PinnedFingerprints(map[string][]string{"USDC@base": {"a42c…"}}))`.
-A pinned asset is checked against your values only; `/assets` is ignored for it.
+A pinned asset is checked against your values only; `/assets` is ignored for it. A pin that pins
+nothing — an empty list, an empty string, anything but 64 hex characters — makes `NewWallet` return
+an error rather than quietly falling back to what `/assets` publishes.
 
 ### Which networks and assets are supported?
 
@@ -242,9 +259,12 @@ sign — not the funds.
 
 ### What happens if a transfer is interrupted?
 
-Every money-moving call takes an idempotency key. Repeating a call with the same key returns the
-original operation instead of starting a second one, so a retry after a timeout with the same key
-replays the first payment rather than making another.
+Every money-moving call is sent under an idempotency key, and repeating a call with the **same** key
+returns the original operation instead of starting a second one. That holds only if your retry
+carries the same key: set `IdempotencyKey` to a durable id (e.g. your payout id) and retry with it,
+and a retry after a timeout replays the first payment rather than making another. Leave it empty —
+the zero value, which Go cannot tell from an explicit `""` — and the SDK generates a fresh key per
+call, so a retry is then a second payment. A key of only whitespace is refused rather than sent.
 
 ## The same wallet, in eight languages
 
